@@ -52,7 +52,23 @@ function setupEventListeners() {
     uploadArea.addEventListener('dragleave', handleDragLeave);
     uploadArea.addEventListener('drop', handleDrop);
     uploadBtn.addEventListener('click', () => startUpload({ retryOnly: false }));
-    retryBtn.addEventListener('click', () => startUpload({ retryOnly: true }));
+    if (retryBtn) {
+        retryBtn.addEventListener('click', () => startUpload({ retryOnly: true }));
+    }
+}
+
+function generateUploadId() {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+        return crypto.randomUUID();
+    }
+
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+    const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 function createQueueEntry(file) {
@@ -60,7 +76,7 @@ function createQueueEntry(file) {
         id: nextEntryId++,
         file,
         status: 'pending',
-        uploadId: crypto.randomUUID(),
+        uploadId: generateUploadId(),
         bytesUploaded: 0
     };
 }
@@ -69,6 +85,7 @@ function createQueueEntry(file) {
 function handleFileSelect(e) {
     const files = Array.from(e.target.files);
     addFiles(files);
+    fileInput.value = '';
 }
 
 function handleDragOver(e) {
@@ -92,11 +109,18 @@ function handleDrop(e) {
 }
 
 function addFiles(files) {
+    if (files.length === 0) return;
+
     const MAX_FILES = 1000;
     const currentCount = uploadQueue.length;
     const newFiles = files.filter(file =>
         !uploadQueue.find(entry => entry.file.name === file.name && entry.file.size === file.size)
     );
+
+    if (newFiles.length === 0) {
+        showToast('Selected file(s) are already in the queue.', 'error');
+        return;
+    }
 
     if (currentCount + newFiles.length > MAX_FILES) {
         const allowed = MAX_FILES - currentCount;
@@ -159,8 +183,10 @@ function updateButtons() {
     uploadBtn.disabled = !hasPending || uploadInProgress;
     uploadBtn.textContent = uploadInProgress ? 'Uploading...' : 'Upload Files';
 
-    retryBtn.style.display = hasFailed && !uploadInProgress ? 'block' : 'none';
-    retryBtn.disabled = uploadInProgress;
+    if (retryBtn) {
+        retryBtn.style.display = hasFailed && !uploadInProgress ? 'block' : 'none';
+        retryBtn.disabled = uploadInProgress;
+    }
 }
 
 function sanitizeFilename(filename) {
