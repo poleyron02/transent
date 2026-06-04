@@ -3,7 +3,7 @@ const path = require('path');
 const { ensureDirectoryExists, getUniqueFilename, sanitizeFilename } = require('./fileManager');
 
 const UPLOADS_DIR = '.transent-uploads';
-const DEFAULT_CHUNK_SIZE = 8 * 1024 * 1024;
+const DEFAULT_CHUNK_SIZE = 2 * 1024 * 1024;
 const MAX_CHUNK_SIZE = DEFAULT_CHUNK_SIZE + 1024;
 
 function getUploadsDir(saveDir) {
@@ -85,6 +85,11 @@ async function initUpload(saveDir, { uploadId, originalName, totalSize, chunkSiz
     };
   }
 
+  const existingPartSize = await getPartSize(partPath);
+  if (existingPartSize > 0) {
+    throw Object.assign(new Error('Upload session corrupted'), { status: 409 });
+  }
+
   const sanitizedName = sanitizeFilename(originalName);
   const targetFilename = await getUniqueFilename(saveDir, sanitizedName);
 
@@ -141,7 +146,16 @@ async function writeChunk(saveDir, uploadId, offset, buffer) {
     throw Object.assign(new Error('Chunk exceeds total file size'), { status: 400 });
   }
 
-  await fs.appendFile(partPath, buffer);
+  const fileHandle = await fs.open(partPath, 'r+');
+  try {
+    await fileHandle.write(buffer, 0, buffer.length, offset);
+    if (typeof fileHandle.sync === 'function') {
+      await fileHandle.sync();
+    }
+  } finally {
+    await fileHandle.close();
+  }
+
   const newOffset = currentSize + buffer.length;
 
   return { offset: newOffset };

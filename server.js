@@ -157,6 +157,8 @@ app.put('/api/upload/chunk', express.raw({ type: 'application/octet-stream', lim
     return res.status(503).json({ error: 'Server not fully initialized. Please try again in a moment.' });
   }
 
+  req.setTimeout(10 * 60 * 1000);
+
   try {
     const uploadId = req.headers['x-upload-id'];
     const offset = parseInt(req.headers['x-chunk-offset'], 10);

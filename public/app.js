@@ -7,8 +7,8 @@ let batchCompletedBytes = 0;
 let currentFileProgress = 0;
 let nextEntryId = 0;
 
-const CHUNK_SIZE = 8 * 1024 * 1024;
-const CHUNK_THRESHOLD = CHUNK_SIZE;
+const CHUNK_SIZE = 2 * 1024 * 1024;
+const CHUNK_THRESHOLD = 8 * 1024 * 1024;
 const MAX_CHUNK_RETRIES = 3;
 const CHUNK_RETRY_DELAYS = [1000, 2000, 4000];
 const CHUNK_XHR_TIMEOUT = 5 * 60 * 1000;
@@ -497,6 +497,7 @@ async function uploadFileChunked(entry, onProgress) {
     try {
         const session = await initChunkUpload(entry);
         let bytesUploaded = session.offset;
+        let resyncCount = 0;
         entry.bytesUploaded = bytesUploaded;
         onProgress(bytesUploaded);
 
@@ -506,14 +507,20 @@ async function uploadFileChunked(entry, onProgress) {
             const chunk = entry.file.slice(chunkStart, chunkEnd);
 
             try {
-                const chunkLength = await sendChunkWithRetry(entry, chunkStart, chunk, (loaded) => {
+                await sendChunkWithRetry(entry, chunkStart, chunk, (loaded) => {
                     entry.bytesUploaded = chunkStart + loaded;
                     onProgress(entry.bytesUploaded);
                 });
 
-                bytesUploaded = chunkStart + chunkLength;
+                bytesUploaded = await verifyUploadOffset(entry, chunkStart + chunk.size);
             } catch (error) {
                 if (error.resyncOffset !== undefined) {
+                    if (error.resyncOffset < bytesUploaded) {
+                        resyncCount++;
+                        if (resyncCount > 5) {
+                            throw new Error('Upload could not recover after repeated sync failures');
+                        }
+                    }
                     bytesUploaded = error.resyncOffset;
                     entry.bytesUploaded = bytesUploaded;
                     onProgress(bytesUploaded);
@@ -536,26 +543,43 @@ async function uploadFileChunked(entry, onProgress) {
     }
 }
 
+async function verifyUploadOffset(entry, expectedOffset) {
+    const session = await initChunkUpload(entry);
+    if (session.offset >= expectedOffset) {
+        return session.offset;
+    }
+
+    const resyncError = new Error('Upload resync required');
+    resyncError.resyncOffset = session.offset;
+    throw resyncError;
+}
+
 async function sendChunkWithRetry(entry, chunkStart, chunk, onChunkProgress) {
     let currentOffset = chunkStart;
     let remainingChunk = chunk;
     let networkAttempts = 0;
+    let syncAttempts = 0;
 
     while (networkAttempts < MAX_CHUNK_RETRIES) {
         try {
             if (remainingChunk.size === 0) {
-                return chunk.size;
+                return;
             }
 
             await sendChunk(entry.uploadId, currentOffset, remainingChunk, onChunkProgress);
-            return chunk.size;
+            return;
         } catch (error) {
             if (error.status === 409) {
+                syncAttempts++;
+                if (syncAttempts > 10) {
+                    throw new Error('Upload could not sync with server');
+                }
+
                 const session = await initChunkUpload(entry);
                 const serverOffset = session.offset;
 
                 if (serverOffset >= chunkStart + chunk.size) {
-                    return chunk.size;
+                    return;
                 }
 
                 if (serverOffset < chunkStart) {
@@ -584,56 +608,33 @@ async function sendChunkWithRetry(entry, chunkStart, chunk, onChunkProgress) {
     throw new Error('Chunk upload failed after retries');
 }
 
-function sendChunk(uploadId, offset, chunk, onChunkProgress) {
-    return new Promise((resolve, reject) => {
-        const xhr = new XMLHttpRequest();
-        xhr.timeout = CHUNK_XHR_TIMEOUT;
+async function sendChunk(uploadId, offset, chunk, onChunkProgress) {
+    const buffer = await chunk.arrayBuffer();
+    onChunkProgress(0);
 
-        xhr.upload.addEventListener('progress', (e) => {
-            if (e.lengthComputable) {
-                onChunkProgress(e.loaded);
-            }
-        });
+    const response = await fetchWithTimeout('/api/upload/chunk', {
+        method: 'PUT',
+        headers: {
+            'Content-Type': 'application/octet-stream',
+            'X-Upload-Id': uploadId,
+            'X-Chunk-Offset': String(offset)
+        },
+        body: buffer
+    }, CHUNK_XHR_TIMEOUT);
 
-        xhr.addEventListener('load', () => {
-            if (xhr.status === 200) {
-                resolve();
-                return;
-            }
+    onChunkProgress(buffer.byteLength);
 
-            let body = {};
-            try {
-                body = JSON.parse(xhr.responseText);
-            } catch {
-                body = {};
-            }
+    if (response.ok) {
+        return;
+    }
 
-            const error = new Error(body.error || 'Chunk upload failed');
-            error.status = xhr.status;
-            if (body.currentOffset !== undefined) {
-                error.currentOffset = body.currentOffset;
-            }
-            reject(error);
-        });
-
-        xhr.addEventListener('error', () => {
-            const error = new Error('Network error');
-            error.status = 0;
-            reject(error);
-        });
-
-        xhr.addEventListener('timeout', () => {
-            const error = new Error('Chunk upload timed out');
-            error.status = 0;
-            reject(error);
-        });
-
-        xhr.open('PUT', '/api/upload/chunk');
-        xhr.setRequestHeader('Content-Type', 'application/octet-stream');
-        xhr.setRequestHeader('X-Upload-Id', uploadId);
-        xhr.setRequestHeader('X-Chunk-Offset', String(offset));
-        xhr.send(chunk);
-    });
+    const body = await response.json().catch(() => ({}));
+    const error = new Error(body.error || 'Chunk upload failed');
+    error.status = response.status;
+    if (body.currentOffset !== undefined) {
+        error.currentOffset = body.currentOffset;
+    }
+    throw error;
 }
 
 function delay(ms) {
