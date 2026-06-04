@@ -47,9 +47,11 @@ async function initUpload(saveDir, { uploadId, originalName, totalSize, chunkSiz
     throw Object.assign(new Error('Invalid upload ID'), { status: 400 });
   }
 
-  if (!originalName || typeof totalSize !== 'number' || totalSize < 0) {
+  if (!originalName || !Number.isFinite(totalSize) || totalSize < 0) {
     throw Object.assign(new Error('Invalid upload parameters'), { status: 400 });
   }
+
+  const normalizedTotalSize = Math.floor(totalSize);
 
   const normalizedChunkSize = chunkSize || DEFAULT_CHUNK_SIZE;
   if (normalizedChunkSize > MAX_CHUNK_SIZE) {
@@ -70,7 +72,7 @@ async function initUpload(saveDir, { uploadId, originalName, totalSize, chunkSiz
   }
 
   if (meta) {
-    if (meta.totalSize !== totalSize || meta.originalName !== originalName) {
+    if (meta.totalSize !== normalizedTotalSize || meta.originalName !== originalName) {
       throw Object.assign(new Error('Upload session mismatch'), { status: 409 });
     }
 
@@ -90,7 +92,7 @@ async function initUpload(saveDir, { uploadId, originalName, totalSize, chunkSiz
     uploadId,
     originalName,
     targetFilename,
-    totalSize,
+    totalSize: normalizedTotalSize,
     chunkSize: normalizedChunkSize,
     createdAt: new Date().toISOString()
   };
@@ -102,7 +104,7 @@ async function initUpload(saveDir, { uploadId, originalName, totalSize, chunkSiz
     uploadId,
     offset: 0,
     targetFilename,
-    totalSize
+    totalSize: normalizedTotalSize
   };
 }
 
@@ -166,6 +168,23 @@ async function completeUpload(saveDir, uploadId) {
 
   if (partSize !== meta.totalSize) {
     throw Object.assign(new Error(`Incomplete upload: ${partSize}/${meta.totalSize} bytes`), { status: 400 });
+  }
+
+  try {
+    const finalStats = await fs.stat(finalPath);
+    if (finalStats.size === meta.totalSize) {
+      await Promise.allSettled([
+        fs.unlink(partPath),
+        fs.unlink(getMetaPath(uploadsDir, uploadId))
+      ]);
+      return {
+        success: true,
+        filename: meta.targetFilename,
+        size: meta.totalSize
+      };
+    }
+  } catch {
+    // Final file doesn't exist yet
   }
 
   try {

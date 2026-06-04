@@ -142,7 +142,7 @@ app.post('/api/upload/init', async (req, res) => {
     const result = await initUpload(SAVE_DIRECTORY, {
       uploadId,
       originalName,
-      totalSize,
+      totalSize: Number(totalSize),
       chunkSize: chunkSize || DEFAULT_CHUNK_SIZE
     });
     res.json(result);

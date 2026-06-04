@@ -12,6 +12,10 @@ const CHUNK_THRESHOLD = CHUNK_SIZE;
 const MAX_CHUNK_RETRIES = 3;
 const CHUNK_RETRY_DELAYS = [1000, 2000, 4000];
 const CHUNK_XHR_TIMEOUT = 5 * 60 * 1000;
+const FETCH_TIMEOUT = 30 * 1000;
+const PROGRESS_UI_INTERVAL = 200;
+
+let lastProgressUiUpdate = 0;
 
 const STATUS_LABELS = {
     pending: 'Pending',
@@ -189,6 +193,31 @@ function updateButtons() {
     }
 }
 
+function updateFileProgressBar() {
+    const fill = fileList.querySelector('.file-item--uploading .file-item-progress-fill');
+    if (fill) {
+        fill.style.width = Math.round(currentFileProgress) + '%';
+    }
+}
+
+function updateProgressUI(currentLoaded = 0, force = false) {
+    const now = Date.now();
+    if (!force && now - lastProgressUiUpdate < PROGRESS_UI_INTERVAL) {
+        return;
+    }
+    lastProgressUiUpdate = now;
+    updateBatchProgress(currentLoaded);
+    updateFileProgressBar();
+}
+
+function fetchWithTimeout(url, options = {}, timeout = FETCH_TIMEOUT) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeout);
+
+    return fetch(url, { ...options, signal: controller.signal })
+        .finally(() => clearTimeout(timer));
+}
+
 function sanitizeFilename(filename) {
     let sanitized = filename
         .replace(/[\/\\]/g, '_')
@@ -243,7 +272,7 @@ function isAlreadyUploaded(file, serverIndex) {
 }
 
 async function fetchServerFiles() {
-    const response = await fetch('/api/files');
+    const response = await fetchWithTimeout('/api/files', {}, FETCH_TIMEOUT);
     if (!response.ok) {
         throw new Error('Failed to fetch server file list');
     }
@@ -300,6 +329,7 @@ async function startUpload({ retryOnly }) {
     uploadInProgress = true;
     updateButtons();
     resetProgressUI();
+    lastProgressUiUpdate = 0;
 
     batchTotalBytes = entriesToProcess.reduce((sum, entry) => sum + entry.file.size, 0);
 
@@ -327,8 +357,7 @@ async function startUpload({ retryOnly }) {
 
             const result = await uploadFileEntry(entry, (loaded) => {
                 currentFileProgress = entry.file.size > 0 ? (loaded / entry.file.size) * 100 : 0;
-                updateBatchProgress(loaded);
-                updateFileList();
+                updateProgressUI(loaded);
             });
 
             if (result.success) {
@@ -342,7 +371,7 @@ async function startUpload({ retryOnly }) {
             }
 
             currentFileProgress = 0;
-            updateBatchProgress(0);
+            updateProgressUI(0, true);
             updateFileList();
         }
     } catch (error) {
@@ -383,6 +412,7 @@ function uploadFileSmall(entry, onProgress) {
         formData.append('files', entry.file);
 
         const xhr = new XMLHttpRequest();
+        xhr.timeout = CHUNK_XHR_TIMEOUT;
 
         xhr.upload.addEventListener('progress', (e) => {
             if (e.lengthComputable) {
@@ -408,13 +438,14 @@ function uploadFileSmall(entry, onProgress) {
         });
 
         xhr.addEventListener('error', () => resolve({ success: false }));
+        xhr.addEventListener('timeout', () => resolve({ success: false }));
         xhr.open('POST', '/upload');
         xhr.send(formData);
     });
 }
 
 async function initChunkUpload(entry) {
-    const response = await fetch('/api/upload/init', {
+    const response = await fetchWithTimeout('/api/upload/init', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -423,7 +454,7 @@ async function initChunkUpload(entry) {
             totalSize: entry.file.size,
             chunkSize: CHUNK_SIZE
         })
-    });
+    }, FETCH_TIMEOUT);
 
     if (!response.ok) {
         const error = await response.json().catch(() => ({}));
@@ -436,11 +467,11 @@ async function initChunkUpload(entry) {
 async function completeChunkUpload(uploadId) {
     for (let attempt = 0; attempt < MAX_CHUNK_RETRIES; attempt++) {
         try {
-            const response = await fetch('/api/upload/complete', {
+            const response = await fetchWithTimeout('/api/upload/complete', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ uploadId })
-            });
+            }, FETCH_TIMEOUT);
 
             if (response.ok) {
                 return response.json();
@@ -474,12 +505,23 @@ async function uploadFileChunked(entry, onProgress) {
             const chunkEnd = Math.min(bytesUploaded + CHUNK_SIZE, entry.file.size);
             const chunk = entry.file.slice(chunkStart, chunkEnd);
 
-            const chunkLength = await sendChunkWithRetry(entry, chunkStart, chunk, (loaded) => {
-                entry.bytesUploaded = chunkStart + loaded;
-                onProgress(entry.bytesUploaded);
-            });
+            try {
+                const chunkLength = await sendChunkWithRetry(entry, chunkStart, chunk, (loaded) => {
+                    entry.bytesUploaded = chunkStart + loaded;
+                    onProgress(entry.bytesUploaded);
+                });
 
-            bytesUploaded = chunkStart + chunkLength;
+                bytesUploaded = chunkStart + chunkLength;
+            } catch (error) {
+                if (error.resyncOffset !== undefined) {
+                    bytesUploaded = error.resyncOffset;
+                    entry.bytesUploaded = bytesUploaded;
+                    onProgress(bytesUploaded);
+                    continue;
+                }
+                throw error;
+            }
+
             entry.bytesUploaded = bytesUploaded;
             onProgress(bytesUploaded);
         }
@@ -494,31 +536,37 @@ async function uploadFileChunked(entry, onProgress) {
     }
 }
 
-async function sendChunkWithRetry(entry, offset, chunk, onChunkProgress) {
-    let currentOffset = offset;
+async function sendChunkWithRetry(entry, chunkStart, chunk, onChunkProgress) {
+    let currentOffset = chunkStart;
     let remainingChunk = chunk;
+    let networkAttempts = 0;
 
-    for (let attempt = 0; attempt < MAX_CHUNK_RETRIES; attempt++) {
+    while (networkAttempts < MAX_CHUNK_RETRIES) {
         try {
+            if (remainingChunk.size === 0) {
+                return chunk.size;
+            }
+
             await sendChunk(entry.uploadId, currentOffset, remainingChunk, onChunkProgress);
             return chunk.size;
         } catch (error) {
             if (error.status === 409) {
                 const session = await initChunkUpload(entry);
-                currentOffset = session.offset;
+                const serverOffset = session.offset;
 
-                if (currentOffset >= offset + chunk.size) {
+                if (serverOffset >= chunkStart + chunk.size) {
                     return chunk.size;
                 }
 
-                if (currentOffset > offset) {
-                    remainingChunk = chunk.slice(currentOffset - offset);
-                    onChunkProgress(currentOffset - offset);
-                } else {
-                    remainingChunk = chunk;
-                    onChunkProgress(0);
+                if (serverOffset < chunkStart) {
+                    const resyncError = new Error('Upload resync required');
+                    resyncError.resyncOffset = serverOffset;
+                    throw resyncError;
                 }
 
+                currentOffset = serverOffset;
+                remainingChunk = chunk.slice(serverOffset - chunkStart);
+                onChunkProgress(serverOffset - chunkStart);
                 continue;
             }
 
@@ -526,8 +574,9 @@ async function sendChunkWithRetry(entry, offset, chunk, onChunkProgress) {
                 throw error;
             }
 
-            if (attempt < MAX_CHUNK_RETRIES - 1) {
-                await delay(CHUNK_RETRY_DELAYS[attempt] || 4000);
+            networkAttempts++;
+            if (networkAttempts < MAX_CHUNK_RETRIES) {
+                await delay(CHUNK_RETRY_DELAYS[networkAttempts - 1] || 4000);
             }
         }
     }
