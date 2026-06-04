@@ -78,7 +78,10 @@ function generateUploadId() {
 function createQueueEntry(file) {
     return {
         id: nextEntryId++,
-        file,
+        name: file.name,
+        size: file.size,
+        type: file.type || 'application/octet-stream',
+        blob: file.slice(0, file.size, file.type || 'application/octet-stream'),
         status: 'pending',
         uploadId: generateUploadId(),
         bytesUploaded: 0
@@ -89,7 +92,6 @@ function createQueueEntry(file) {
 function handleFileSelect(e) {
     const files = Array.from(e.target.files);
     addFiles(files);
-    fileInput.value = '';
 }
 
 function handleDragOver(e) {
@@ -118,11 +120,12 @@ function addFiles(files) {
     const MAX_FILES = 1000;
     const currentCount = uploadQueue.length;
     const newFiles = files.filter(file =>
-        !uploadQueue.find(entry => entry.file.name === file.name && entry.file.size === file.size)
+        !uploadQueue.find(entry => entry.name === file.name && entry.size === file.size)
     );
 
     if (newFiles.length === 0) {
         showToast('Selected file(s) are already in the queue.', 'error');
+        fileInput.value = '';
         return;
     }
 
@@ -138,6 +141,7 @@ function addFiles(files) {
         newFiles.forEach(file => uploadQueue.push(createQueueEntry(file)));
     }
 
+    fileInput.value = '';
     updateFileList();
     updateButtons();
 }
@@ -168,10 +172,10 @@ function updateFileList() {
         <div class="file-item file-item--${entry.status}">
             <div class="file-item-info">
                 <div class="file-item-header">
-                    <div class="file-item-name">${escapeHtml(entry.file.name)}</div>
+                    <div class="file-item-name">${escapeHtml(entry.name)}</div>
                     <span class="file-item-status file-item-status--${entry.status}">${STATUS_LABELS[entry.status]}</span>
                 </div>
-                <div class="file-item-size">${formatFileSize(entry.file.size)}</div>
+                <div class="file-item-size">${formatFileSize(entry.size)}</div>
                 ${progressBar}
             </div>
             ${canRemove ? `<button class="file-item-remove" onclick="removeFile(${index})">Remove</button>` : ''}
@@ -331,7 +335,7 @@ async function startUpload({ retryOnly }) {
     resetProgressUI();
     lastProgressUiUpdate = 0;
 
-    batchTotalBytes = entriesToProcess.reduce((sum, entry) => sum + entry.file.size, 0);
+    batchTotalBytes = entriesToProcess.reduce((sum, entry) => sum + entry.size, 0);
 
     let uploadedCount = 0;
     let skippedCount = 0;
@@ -342,10 +346,10 @@ async function startUpload({ retryOnly }) {
         const serverIndex = buildServerFileIndex(serverFiles);
 
         for (const entry of entriesToProcess) {
-            if (isAlreadyUploaded(entry.file, serverIndex)) {
+            if (isAlreadyUploaded({ name: entry.name, size: entry.size }, serverIndex)) {
                 entry.status = 'skipped';
                 skippedCount++;
-                batchCompletedBytes += entry.file.size;
+                batchCompletedBytes += entry.size;
                 updateBatchProgress(0);
                 updateFileList();
                 continue;
@@ -354,17 +358,18 @@ async function startUpload({ retryOnly }) {
             entry.status = 'uploading';
             currentFileProgress = 0;
             updateFileList();
+            updateProgressUI(0, true);
 
             const result = await uploadFileEntry(entry, (loaded) => {
-                currentFileProgress = entry.file.size > 0 ? (loaded / entry.file.size) * 100 : 0;
+                currentFileProgress = entry.size > 0 ? (loaded / entry.size) * 100 : 0;
                 updateProgressUI(loaded);
             });
 
             if (result.success) {
                 entry.status = 'done';
                 uploadedCount++;
-                batchCompletedBytes += entry.file.size;
-                serverIndex.set(`${result.filename}\0${entry.file.size}`, { name: result.filename, size: entry.file.size });
+                batchCompletedBytes += entry.size;
+                serverIndex.set(`${result.filename}\0${entry.size}`, { name: result.filename, size: entry.size });
             } else {
                 entry.status = 'failed';
                 failedCount++;
@@ -400,7 +405,7 @@ async function startUpload({ retryOnly }) {
 }
 
 function uploadFileEntry(entry, onProgress) {
-    if (entry.file.size <= CHUNK_THRESHOLD) {
+    if (entry.size <= CHUNK_THRESHOLD) {
         return uploadFileSmallWithRetry(entry, onProgress);
     }
     return uploadFileChunked(entry, onProgress);
@@ -428,8 +433,8 @@ function readBlobAsArrayBuffer(blob) {
     });
 }
 
-async function readFileChunk(file, start, end) {
-    const slice = file.slice(start, end);
+async function readFileChunk(blob, start, end) {
+    const slice = blob.slice(start, end);
     if (typeof slice.arrayBuffer === 'function') {
         try {
             return await slice.arrayBuffer();
@@ -442,8 +447,10 @@ async function readFileChunk(file, start, end) {
 
 function uploadFileSmall(entry, onProgress) {
     return new Promise((resolve) => {
+        onProgress(0);
+
         const formData = new FormData();
-        formData.append('files', entry.file);
+        formData.append('files', entry.blob, entry.name);
 
         const xhr = new XMLHttpRequest();
         xhr.timeout = CHUNK_XHR_TIMEOUT;
@@ -461,7 +468,7 @@ function uploadFileSmall(entry, onProgress) {
                     const uploaded = response.files && response.files[0];
                     resolve({
                         success: true,
-                        filename: uploaded ? uploaded.name : sanitizeFilename(entry.file.name)
+                        filename: uploaded ? uploaded.name : sanitizeFilename(entry.name)
                     });
                 } catch {
                     resolve({ success: false });
@@ -484,8 +491,8 @@ async function initChunkUpload(entry) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
             uploadId: entry.uploadId,
-            originalName: entry.file.name,
-            totalSize: entry.file.size,
+            originalName: entry.name,
+            totalSize: entry.size,
             chunkSize: CHUNK_SIZE
         })
     }, FETCH_TIMEOUT);
@@ -535,11 +542,11 @@ async function uploadFileChunked(entry, onProgress) {
         entry.bytesUploaded = bytesUploaded;
         onProgress(bytesUploaded);
 
-        while (bytesUploaded < entry.file.size) {
+        while (bytesUploaded < entry.size) {
             const chunkStart = bytesUploaded;
-            const chunkEnd = Math.min(bytesUploaded + CHUNK_SIZE, entry.file.size);
+            const chunkEnd = Math.min(bytesUploaded + CHUNK_SIZE, entry.size);
             const chunkLength = chunkEnd - chunkStart;
-            const buffer = await readFileChunk(entry.file, chunkStart, chunkEnd);
+            const buffer = await readFileChunk(entry.blob, chunkStart, chunkEnd);
 
             try {
                 await sendChunkWithRetry(entry, chunkStart, buffer, chunkLength, (loaded) => {
