@@ -63,7 +63,9 @@ async function listFiles(dirPath) {
   try {
     const files = await fs.readdir(dirPath);
     const fileInfos = await Promise.all(
-      files.map(file => getFileInfo(path.join(dirPath, file)))
+      files
+        .filter(file => file !== '.transent-uploads' && !file.endsWith('.part'))
+        .map(file => getFileInfo(path.join(dirPath, file)))
     );
     
     // Filter out nulls and directories, sort by modified date (newest first)

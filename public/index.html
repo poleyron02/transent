@@ -34,7 +34,10 @@
                     </div>
                 </div>
                 <div class="file-list" id="fileList"></div>
-                <button class="btn btn-primary" id="uploadBtn" disabled>Upload Files</button>
+                <div class="upload-actions">
+                    <button class="btn btn-primary" id="uploadBtn" disabled>Upload Files</button>
+                    <button class="btn btn-secondary" id="retryBtn" style="display: none;">Retry Failed</button>
+                </div>
                 <div class="progress-container" id="progressContainer" style="display: none;">
                     <div class="progress-header">
                         <span class="progress-label">Uploading...</span>

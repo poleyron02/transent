@@ -199,9 +199,69 @@ section:hover {
     margin-bottom: 4px;
 }
 
+.file-item-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 4px;
+}
+
 .file-item-size {
     font-size: 0.75rem;
     color: var(--text-tertiary);
+}
+
+.file-item-status {
+    font-size: 0.6875rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    padding: 2px 8px;
+    border-radius: 999px;
+    flex-shrink: 0;
+    white-space: nowrap;
+}
+
+.file-item-status--pending {
+    color: var(--text-tertiary);
+    background: rgba(148, 163, 184, 0.15);
+}
+
+.file-item-status--uploading {
+    color: var(--primary-light);
+    background: rgba(124, 58, 237, 0.15);
+}
+
+.file-item-status--done {
+    color: var(--success-color);
+    background: rgba(16, 185, 129, 0.15);
+}
+
+.file-item-status--failed {
+    color: var(--error-color);
+    background: rgba(239, 68, 68, 0.15);
+}
+
+.file-item-status--skipped {
+    color: var(--text-tertiary);
+    background: rgba(148, 163, 184, 0.1);
+}
+
+.file-item-progress {
+    width: 100%;
+    height: 4px;
+    background: var(--bg-primary);
+    border-radius: 2px;
+    overflow: hidden;
+    margin-top: 8px;
+}
+
+.file-item-progress-fill {
+    height: 100%;
+    background: var(--primary-color);
+    border-radius: 2px;
+    transition: width 0.2s ease;
 }
 
 .file-item-remove {
@@ -257,6 +317,29 @@ section:hover {
     color: var(--text-tertiary);
     cursor: not-allowed;
     opacity: 0.5;
+}
+
+.upload-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.btn-secondary {
+    background: transparent;
+    color: var(--text-secondary);
+    border: 1px solid var(--border-color);
+}
+
+.btn-secondary:hover:not(:disabled) {
+    background: var(--bg-tertiary);
+    border-color: var(--border-hover);
+    color: var(--text-primary);
+}
+
+.btn-secondary:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
 }
 
 /* Progress Container */

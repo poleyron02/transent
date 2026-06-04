@@ -6,6 +6,15 @@ const fs = require('fs').promises;
 const { getSaveDirectory } = require('./config');
 const { displayServerInfo } = require('./utils/networkUtils');
 const { ensureDirectoryExists, getUniqueFilename, listFiles, formatFileSize } = require('./utils/fileManager');
+const {
+  initUpload,
+  writeChunk,
+  completeUpload,
+  abortUpload,
+  cleanupStaleUploads,
+  DEFAULT_CHUNK_SIZE,
+  MAX_CHUNK_SIZE
+} = require('./utils/chunkUpload');
 
 const app = express();
 let SAVE_DIRECTORY = null;
@@ -59,7 +68,7 @@ app.get('/api/files', async (req, res) => {
     }
 });
 
-// Upload files
+// Upload files (small-file fallback)
 app.post('/upload', async (req, res) => {
     if (!SAVE_DIRECTORY) {
         return res.status(503).json({ error: 'Server not fully initialized. Please try again in a moment.' });
@@ -111,6 +120,85 @@ app.post('/upload', async (req, res) => {
         console.error('Upload setup error:', error);
         res.status(500).json({ error: 'Upload setup failed: ' + error.message });
     }
+});
+
+function handleChunkError(res, error) {
+  const status = error.status || 500;
+  const body = { error: error.message || 'Chunk upload failed' };
+  if (error.currentOffset !== undefined) {
+    body.currentOffset = error.currentOffset;
+  }
+  return res.status(status).json(body);
+}
+
+// Chunked upload: initialize session
+app.post('/api/upload/init', async (req, res) => {
+  if (!SAVE_DIRECTORY) {
+    return res.status(503).json({ error: 'Server not fully initialized. Please try again in a moment.' });
+  }
+
+  try {
+    const { uploadId, originalName, totalSize, chunkSize } = req.body || {};
+    const result = await initUpload(SAVE_DIRECTORY, {
+      uploadId,
+      originalName,
+      totalSize,
+      chunkSize: chunkSize || DEFAULT_CHUNK_SIZE
+    });
+    res.json(result);
+  } catch (error) {
+    handleChunkError(res, error);
+  }
+});
+
+// Chunked upload: write chunk
+app.put('/api/upload/chunk', express.raw({ type: 'application/octet-stream', limit: MAX_CHUNK_SIZE }), async (req, res) => {
+  if (!SAVE_DIRECTORY) {
+    return res.status(503).json({ error: 'Server not fully initialized. Please try again in a moment.' });
+  }
+
+  try {
+    const uploadId = req.headers['x-upload-id'];
+    const offset = parseInt(req.headers['x-chunk-offset'], 10);
+
+    if (!uploadId || Number.isNaN(offset)) {
+      return res.status(400).json({ error: 'Missing X-Upload-Id or X-Chunk-Offset header' });
+    }
+
+    const result = await writeChunk(SAVE_DIRECTORY, uploadId, offset, req.body);
+    res.json(result);
+  } catch (error) {
+    handleChunkError(res, error);
+  }
+});
+
+// Chunked upload: finalize
+app.post('/api/upload/complete', async (req, res) => {
+  if (!SAVE_DIRECTORY) {
+    return res.status(503).json({ error: 'Server not fully initialized. Please try again in a moment.' });
+  }
+
+  try {
+    const { uploadId } = req.body || {};
+    const result = await completeUpload(SAVE_DIRECTORY, uploadId);
+    res.json(result);
+  } catch (error) {
+    handleChunkError(res, error);
+  }
+});
+
+// Chunked upload: cancel and remove partial
+app.delete('/api/upload/:uploadId', async (req, res) => {
+  if (!SAVE_DIRECTORY) {
+    return res.status(503).json({ error: 'Server not fully initialized. Please try again in a moment.' });
+  }
+
+  try {
+    const result = await abortUpload(SAVE_DIRECTORY, req.params.uploadId);
+    res.json(result);
+  } catch (error) {
+    handleChunkError(res, error);
+  }
 });
 
 // Download file
@@ -191,6 +279,7 @@ async function startServer() {
 
         // Ensure directory exists
         await ensureDirectoryExists(SAVE_DIRECTORY);
+        await cleanupStaleUploads(SAVE_DIRECTORY);
 
         app.listen(port, () => {
             displayServerInfo(port, SAVE_DIRECTORY);
