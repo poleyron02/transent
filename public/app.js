@@ -7,13 +7,18 @@ let batchCompletedBytes = 0;
 let currentFileProgress = 0;
 let nextEntryId = 0;
 
-const CHUNK_SIZE = 2 * 1024 * 1024;
-const CHUNK_THRESHOLD = 100 * 1024 * 1024;
+const CHUNK_SIZE_DESKTOP = 2 * 1024 * 1024;
+const CHUNK_SIZE_IOS = 1 * 1024 * 1024;
+const CHUNK_THRESHOLD_DESKTOP = 100 * 1024 * 1024;
+const CHUNK_THRESHOLD_IOS = 1024 * 1024 * 1024;
 const MAX_CHUNK_RETRIES = 3;
 const CHUNK_RETRY_DELAYS = [1000, 2000, 4000];
 const CHUNK_XHR_TIMEOUT = 5 * 60 * 1000;
+const MAX_UPLOAD_TIMEOUT = 60 * 60 * 1000;
+const MIN_UPLOAD_SPEED = 256 * 1024;
 const FETCH_TIMEOUT = 30 * 1000;
 const PROGRESS_UI_INTERVAL = 200;
+const BLOB_SNAPSHOT_LIMIT = 50 * 1024 * 1024;
 
 let lastProgressUiUpdate = 0;
 
@@ -75,17 +80,130 @@ function generateUploadId() {
     return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
+function isIOSSafari() {
+    const ua = navigator.userAgent;
+    const isIOS = /iPad|iPhone|iPod/.test(ua)
+        || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    return isIOS && /Safari/.test(ua) && !/CriOS|FxiOS|EdgiOS/.test(ua);
+}
+
+function getChunkSize() {
+    return isIOSSafari() ? CHUNK_SIZE_IOS : CHUNK_SIZE_DESKTOP;
+}
+
+function getChunkThreshold() {
+    return isIOSSafari() ? CHUNK_THRESHOLD_IOS : CHUNK_THRESHOLD_DESKTOP;
+}
+
+function getUploadTimeout(fileSize) {
+    const estimated = (fileSize / MIN_UPLOAD_SPEED) * 1000;
+    return Math.min(Math.max(estimated, CHUNK_XHR_TIMEOUT), MAX_UPLOAD_TIMEOUT);
+}
+
 function createQueueEntry(file) {
-    return {
+    const entry = {
         id: nextEntryId++,
         name: file.name,
         size: file.size,
         type: file.type || 'application/octet-stream',
-        blob: file.slice(0, file.size, file.type || 'application/octet-stream'),
+        file,
         status: 'pending',
         uploadId: generateUploadId(),
         bytesUploaded: 0
     };
+
+    if (file.size <= BLOB_SNAPSHOT_LIMIT) {
+        entry.blob = file.slice(0, file.size, entry.type);
+    }
+
+    return entry;
+}
+
+function getUploadSource(entry) {
+    if (entry.file && entry.file.size === entry.size) {
+        return entry.file;
+    }
+    if (!entry.blob) {
+        entry.blob = entry.file.slice(0, entry.size, entry.type);
+    }
+    return entry.blob;
+}
+
+class SequentialBlobReader {
+    constructor(source) {
+        this.source = source;
+        this.reader = null;
+        this.workBlob = null;
+        this.pending = new Uint8Array(0);
+        this.position = 0;
+    }
+
+    async seek(offset) {
+        await this.close();
+        this.position = offset;
+    }
+
+    async read(length) {
+        if (!this.reader) {
+            this.workBlob = this.source.slice(this.position);
+            this.reader = this.workBlob.stream().getReader();
+        }
+
+        const parts = [];
+        let collected = 0;
+
+        if (this.pending.length > 0) {
+            const take = Math.min(this.pending.length, length);
+            parts.push(this.pending.slice(0, take));
+            this.pending = this.pending.slice(take);
+            collected += take;
+        }
+
+        while (collected < length) {
+            const { done, value } = await this.reader.read();
+            if (done) {
+                break;
+            }
+
+            const needed = length - collected;
+            if (value.byteLength <= needed) {
+                parts.push(value);
+                collected += value.byteLength;
+            } else {
+                parts.push(value.slice(0, needed));
+                this.pending = value.slice(needed);
+                collected += needed;
+            }
+        }
+
+        this.position += collected;
+
+        if (collected === 0) {
+            return new ArrayBuffer(0);
+        }
+
+        if (parts.length === 1) {
+            const part = parts[0];
+            return part.buffer.slice(part.byteOffset, part.byteOffset + part.byteLength);
+        }
+
+        const combined = new Uint8Array(collected);
+        let offset = 0;
+        for (const part of parts) {
+            combined.set(part, offset);
+            offset += part.byteLength;
+        }
+        return combined.buffer;
+    }
+
+    async close() {
+        if (this.reader) {
+            await this.reader.cancel().catch(() => {});
+            this.reader = null;
+        }
+        this.workBlob = null;
+        this.pending = new Uint8Array(0);
+    }
 }
 
 // File Selection
@@ -125,7 +243,6 @@ function addFiles(files) {
 
     if (newFiles.length === 0) {
         showToast('Selected file(s) are already in the queue.', 'error');
-        fileInput.value = '';
         return;
     }
 
@@ -141,7 +258,6 @@ function addFiles(files) {
         newFiles.forEach(file => uploadQueue.push(createQueueEntry(file)));
     }
 
-    fileInput.value = '';
     updateFileList();
     updateButtons();
 }
@@ -385,12 +501,14 @@ async function startUpload({ retryOnly }) {
         progressContainer.style.display = 'none';
         updateButtons();
         updateFileList();
+        fileInput.value = '';
         return;
     }
 
     uploadInProgress = false;
     progressContainer.style.display = 'none';
     updateButtons();
+    fileInput.value = '';
 
     const allFinished = uploadQueue.every(entry =>
         entry.status === 'done' || entry.status === 'skipped'
@@ -405,7 +523,7 @@ async function startUpload({ retryOnly }) {
 }
 
 function uploadFileEntry(entry, onProgress) {
-    if (entry.size <= CHUNK_THRESHOLD) {
+    if (entry.size <= getChunkThreshold()) {
         return uploadFileSmallWithRetry(entry, onProgress);
     }
     return uploadFileChunked(entry, onProgress);
@@ -424,36 +542,15 @@ async function uploadFileSmallWithRetry(entry, onProgress) {
     return { success: false };
 }
 
-function readBlobAsArrayBuffer(blob) {
-    return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(reader.result);
-        reader.onerror = () => reject(reader.error || new Error('Failed to read file chunk'));
-        reader.readAsArrayBuffer(blob);
-    });
-}
-
-async function readFileChunk(blob, start, end) {
-    const slice = blob.slice(start, end);
-    if (typeof slice.arrayBuffer === 'function') {
-        try {
-            return await slice.arrayBuffer();
-        } catch {
-            // Fall back to FileReader on mobile browsers that fail slice.arrayBuffer()
-        }
-    }
-    return readBlobAsArrayBuffer(slice);
-}
-
 function uploadFileSmall(entry, onProgress) {
     return new Promise((resolve) => {
         onProgress(0);
 
         const formData = new FormData();
-        formData.append('files', entry.blob, entry.name);
+        formData.append('files', getUploadSource(entry), entry.name);
 
         const xhr = new XMLHttpRequest();
-        xhr.timeout = CHUNK_XHR_TIMEOUT;
+        xhr.timeout = getUploadTimeout(entry.size);
 
         xhr.upload.addEventListener('progress', (e) => {
             if (e.lengthComputable) {
@@ -493,7 +590,7 @@ async function initChunkUpload(entry) {
             uploadId: entry.uploadId,
             originalName: entry.name,
             totalSize: entry.size,
-            chunkSize: CHUNK_SIZE
+            chunkSize: getChunkSize()
         })
     }, FETCH_TIMEOUT);
 
@@ -535,6 +632,9 @@ async function completeChunkUpload(uploadId) {
 }
 
 async function uploadFileChunked(entry, onProgress) {
+    const reader = new SequentialBlobReader(getUploadSource(entry));
+    const chunkSize = getChunkSize();
+
     try {
         const session = await initChunkUpload(entry);
         let bytesUploaded = session.offset;
@@ -542,19 +642,26 @@ async function uploadFileChunked(entry, onProgress) {
         entry.bytesUploaded = bytesUploaded;
         onProgress(bytesUploaded);
 
+        if (bytesUploaded > 0) {
+            await reader.seek(bytesUploaded);
+        }
+
         while (bytesUploaded < entry.size) {
             const chunkStart = bytesUploaded;
-            const chunkEnd = Math.min(bytesUploaded + CHUNK_SIZE, entry.size);
-            const chunkLength = chunkEnd - chunkStart;
-            const buffer = await readFileChunk(entry.blob, chunkStart, chunkEnd);
+            const chunkLength = Math.min(chunkSize, entry.size - bytesUploaded);
+            const buffer = await reader.read(chunkLength);
+
+            if (buffer.byteLength === 0) {
+                throw new Error('Failed to read file data');
+            }
 
             try {
-                await sendChunkWithRetry(entry, chunkStart, buffer, chunkLength, (loaded) => {
+                await sendChunkWithRetry(entry, chunkStart, buffer, buffer.byteLength, (loaded) => {
                     entry.bytesUploaded = chunkStart + loaded;
                     onProgress(entry.bytesUploaded);
-                });
+                }, getUploadTimeout(buffer.byteLength));
 
-                bytesUploaded = await verifyUploadOffset(entry, chunkStart + chunkLength);
+                bytesUploaded = await verifyUploadOffset(entry, chunkStart + buffer.byteLength);
             } catch (error) {
                 if (error.resyncOffset !== undefined) {
                     if (error.resyncOffset < bytesUploaded) {
@@ -565,6 +672,7 @@ async function uploadFileChunked(entry, onProgress) {
                     }
                     bytesUploaded = error.resyncOffset;
                     entry.bytesUploaded = bytesUploaded;
+                    await reader.seek(bytesUploaded);
                     onProgress(bytesUploaded);
                     continue;
                 }
@@ -582,6 +690,8 @@ async function uploadFileChunked(entry, onProgress) {
         };
     } catch {
         return { success: false };
+    } finally {
+        await reader.close();
     }
 }
 
@@ -596,7 +706,7 @@ async function verifyUploadOffset(entry, expectedOffset) {
     throw resyncError;
 }
 
-async function sendChunkWithRetry(entry, chunkStart, buffer, chunkLength, onChunkProgress) {
+async function sendChunkWithRetry(entry, chunkStart, buffer, chunkLength, onChunkProgress, timeout) {
     let currentOffset = chunkStart;
     let remainingBuffer = buffer;
     let networkAttempts = 0;
@@ -608,7 +718,7 @@ async function sendChunkWithRetry(entry, chunkStart, buffer, chunkLength, onChun
                 return;
             }
 
-            await sendChunk(entry.uploadId, currentOffset, remainingBuffer, onChunkProgress);
+            await sendChunk(entry.uploadId, currentOffset, remainingBuffer, onChunkProgress, timeout);
             return;
         } catch (error) {
             if (error.status === 409) {
@@ -651,10 +761,10 @@ async function sendChunkWithRetry(entry, chunkStart, buffer, chunkLength, onChun
     throw new Error('Chunk upload failed after retries');
 }
 
-function sendChunk(uploadId, offset, buffer, onChunkProgress) {
+function sendChunk(uploadId, offset, buffer, onChunkProgress, timeout = CHUNK_XHR_TIMEOUT) {
     return new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
-        xhr.timeout = CHUNK_XHR_TIMEOUT;
+        xhr.timeout = timeout;
 
         xhr.upload.addEventListener('progress', (e) => {
             if (e.lengthComputable) {
